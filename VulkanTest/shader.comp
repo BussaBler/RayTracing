@@ -1,0 +1,433 @@
+#version 450
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout (binding = 0, rgba32f) uniform image2D finalImage;
+
+const int MAX_BOUNCES = 5;
+const int NUM_RAYS_PER_PIXEL = 1;
+const float DEFOCUS_STRENGTH = 0;
+const float DIVERGE_STRENGTH = 1.0;
+const float FOCUS_DISTANCE = 7.0;
+const vec3 sunLightDirection = normalize(vec3(3.0, 1.0, -5.0));
+const vec3 groundColor = vec3(0.35, 0.3, 0.35);
+const vec3 skyColorHorizon = vec3(1);
+const vec3 skyColorZenith = vec3(0.0788092, 0.36480793, 0.7264151);
+const float sunFocus = 200;
+const float sunIntensity = 500;
+
+struct Material {
+    vec4 color;
+    vec4 emissionColor;
+    float smoothness;
+    float emissionStrenght;
+    float specularProbability;
+};
+
+struct Sphere {
+    vec3 center;
+    float radius;
+    Material material;
+};
+
+struct Camera {
+    vec3 pos;
+    vec3 forwards;
+    vec3 right;
+    vec3 up;
+    vec3 frames;
+};
+
+layout (binding = 1) uniform cameraIn {
+    Camera worldCamera;
+};
+
+struct HitInfo {
+    bool didHit;
+    float dst;
+    vec3 hitPoint;
+    vec3 normal;
+    Material material;
+};
+
+struct Ray {
+    vec3 origin;
+    vec3 dir;
+};
+
+struct Triangle {
+    vec3 posA, posB, posC;
+    vec3 normalA, normalB, normalC;
+    Material material;
+    vec3 min, max;
+};
+
+struct ShaderTriangle {
+    vec3 posA, posB, posC;
+    vec3 normalA, normalB, normalC;
+    Material material;
+};
+
+struct MeshInfo {
+    vec4 info;
+    Material material;
+    vec4 boundsMin;
+    vec4 boundsMax;
+};
+
+struct BoundingBox {
+    vec3 boundsMin;
+	vec3 boundsMax;
+};
+
+struct Node {
+    BoundingBox bounds;
+    int triangleIndex;
+    int triangleCount;
+    int childIndex;
+};
+
+layout (std140, binding = 2) buffer trianglesBuffer {
+    Triangle[] triBuffer;
+};
+
+layout (std140, binding = 3) buffer meshesInfo {
+    MeshInfo[] meshesBuffer;
+};
+
+layout (std140, binding = 4) buffer nodeBuffer {
+    Node[] nodesBuffer;
+};
+
+const uint numSpheres = 1;
+Sphere spheres[numSpheres] = {
+    Sphere(vec3(0, 0, -2.2), 0.8, Material(vec4(0), vec4(1, 1, 1, 0), 0, 10, 0)),
+//    Sphere(vec3(0, 0.35, 0), .5, Material(vec3(0.9, 0.45, 0.4), vec3(0), 0, 1, 0.10)),
+//    Sphere(vec3(0, -0.35, 0), .5, Material(vec3(0.9, 0.45, 0.4), vec3(0), 0, 1, 0.10)),
+//    Sphere(vec3(0, 0, -0.75), .5, Material(vec3(0.9, 0.45, 0.4), vec3(0), 0, 1, 0.10)),
+//    Sphere(vec3(0, 0, -1.5), .5, Material(vec3(0.9, 0.45, 0.4), vec3(0), 0, 1, 0.10))
+};
+
+
+HitInfo hit(Ray ray, Sphere sphere);
+HitInfo hitNormalTriangle(Ray ray, Triangle tri, Material material);
+HitInfo rayTriangleBVHTest(Ray ray, inout uint tries);
+float randomValue(inout uint state);
+float randomValueNormalDistribution(inout uint state);
+vec3 randomDirection(inout uint state);
+vec3 randomHemisphereDirection(vec3 normal, inout uint state);
+vec2 randomPointOnCircle(inout uint rngState);
+vec3 trace(Ray ray, inout uint state);
+vec3 getEnviromentColor(Ray pRay);
+HitInfo calculateRayHit(Ray ray, inout uint numOfTriTests);
+
+    
+void main() {
+    ivec2 pixelPos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 screenSize = imageSize(finalImage);
+    if (pixelPos.x >= screenSize.x || pixelPos.y >= screenSize.y) {
+        return;
+    }
+
+    uvec2 pixelCoord = pixelPos * screenSize;
+    uint pixelIndex = pixelCoord.y * screenSize.x + pixelCoord.x;
+    uint rngState = pixelIndex + 719393 * uint(worldCamera.frames.x);
+    float horiCoefficient = (float(pixelPos.x) * 2 - screenSize.x) / screenSize.x;
+    float vertCoefficient = (float(pixelPos.y) * 2 - screenSize.y) / screenSize.x;
+
+    Camera camera;
+    camera.pos = worldCamera.pos;
+    camera.forwards = worldCamera.forwards;
+    camera.right = cross(worldCamera.forwards, worldCamera.up);
+    camera.up = worldCamera.up;
+
+    Ray ray;
+
+    vec3 finalColor = vec3(0);
+
+    for (int rayIndex = 0; rayIndex < NUM_RAYS_PER_PIXEL; rayIndex++) {
+
+        vec2 defocusJitter = randomPointOnCircle(rngState) * DEFOCUS_STRENGTH / screenSize.x; 
+        ray.origin = camera.pos + camera.right * defocusJitter.x + camera.up * defocusJitter.y;
+
+        vec2 jitter = randomPointOnCircle(rngState) * DIVERGE_STRENGTH / screenSize.x;
+        ray.dir = normalize(camera.pos + (camera.forwards + (horiCoefficient + jitter.x) * camera.right + (vertCoefficient + jitter.y) * camera.up) * FOCUS_DISTANCE - ray.origin);
+        finalColor += trace(ray, rngState);
+    }
+    finalColor = finalColor / NUM_RAYS_PER_PIXEL;
+
+    vec4 oldColor = imageLoad(finalImage, pixelPos);
+    float weight = 1.0 / (worldCamera.frames.x + 1);
+    vec4 colorPass = clamp(mix(oldColor, vec4(finalColor, 1.0), weight), vec4(0), vec4(1));
+    
+    imageStore(finalImage, pixelPos, colorPass);
+}
+
+vec3 trace(Ray ray, inout uint state) {
+
+    vec3 rayColor = vec3(1.0);
+    vec3 incomingLight = vec3(0); 
+    uint numOfTriTests = 0;
+
+    for (int i = 0; i <= MAX_BOUNCES; i++) {
+        HitInfo hitInfo = calculateRayHit(ray, numOfTriTests);
+        if (hitInfo.didHit) {
+            Material material = hitInfo.material;
+            ray.origin = hitInfo.hitPoint;
+            vec3 diffuseDir = normalize(hitInfo.normal + randomDirection(state));
+            vec3 specularDir = reflect(ray.dir, hitInfo.normal);
+            int isSpecularBounce = material.specularProbability >= randomValue(state) ? 1 : 0;
+            ray.dir = mix(diffuseDir, specularDir, material.smoothness * isSpecularBounce);
+            
+            vec3 emittedLight = material.emissionColor.xyz * material.emissionStrenght;
+            incomingLight += emittedLight * rayColor;
+            rayColor *= mix(material.color.xyz, vec3(1), isSpecularBounce);
+        } 
+        else {
+            incomingLight += getEnviromentColor(ray) * rayColor;
+            break;
+        }
+    }
+
+    float debugVis = numOfTriTests / 4.0;
+    //return debugVis < 1 ? vec3(debugVis) : vec3(1, 0, 0);
+    return incomingLight;
+}
+
+bool rayBoundingBox(Ray pRay, vec3 boxMin, vec3 boxMax) {
+    const float epsilon = 0;  // Small epsilon value to handle precision issues
+
+    vec3 invDir = 1.0 / (pRay.dir + vec3(epsilon));  // Avoid division by zero by adding epsilon
+    vec3 tMin = (boxMin - pRay.origin) * invDir;
+    vec3 tMax = (boxMax - pRay.origin) * invDir;
+    vec3 t1 = min(tMin, tMax);
+    vec3 t2 = max(tMin, tMax);
+    float tNear = max(max(t1.x, t1.y), t1.z);
+    float tFar = min(min(t2.x, t2.y), t2.z);
+
+    bool hit = tFar >= tNear && tFar > epsilon;
+    return hit;
+}
+
+float rayBoundingBoxDst(Ray pRay, vec3 boxMin, vec3 boxMax) {
+    const float epsilon = 0;
+
+    vec3 invDir = 1.0 / (pRay.dir + vec3(epsilon));
+    vec3 tMin = (boxMin - pRay.origin) * invDir;
+    vec3 tMax = (boxMax - pRay.origin) * invDir;
+    vec3 t1 = min(tMin, tMax);
+    vec3 t2 = max(tMin, tMax);
+    float tNear = max(max(t1.x, t1.y), t1.z);
+    float tFar = min(min(t2.x, t2.y), t2.z);
+
+    bool hit = tFar >= tNear && tFar > epsilon;
+    return hit ? tNear : 1.0 / 0.0;
+}
+
+HitInfo hitNormalTriangle(Ray ray, Triangle tri, Material material) {
+    vec3 edgeAB = tri.posB - tri.posA;
+    vec3 edgeAC = tri.posC - tri.posA;
+    vec3 normalVector = cross(edgeAB, edgeAC);
+    vec3 ao = ray.origin - tri.posA;
+    vec3 dao = cross(ao, ray.dir);
+
+    float determinant = -dot(ray.dir, normalVector);
+    float invDet = 1 / determinant;
+
+    float dst = dot(ao, normalVector) * invDet;
+    float u = dot(edgeAC, dao) * invDet;
+    float v = -dot(edgeAB, dao) * invDet;
+    float w = 1 - u - v;
+
+    HitInfo hitInfo;
+    hitInfo.didHit = determinant >= 1e-8 && dst >=0 && u >= 0 && v >= 0 && w >=0;
+    if (hitInfo.didHit) {
+        hitInfo.hitPoint = ray.origin + ray.dir * dst;
+        hitInfo.normal = normalize(tri.normalA * w + tri.normalB * u + tri.normalC * v);
+        hitInfo.dst = dst;
+        hitInfo.material = tri.material;
+    }
+    return hitInfo;
+}
+
+HitInfo rayTriangleBVHTest(Ray ray, inout uint tries) {
+    int nodeStack[33];
+    int stackIndex = 0;
+    nodeStack[stackIndex++] = 0;
+
+    HitInfo state;
+    state.didHit = false;
+    state.dst = 1.0 / 0.0;
+    state.hitPoint = vec3(0);
+    state.normal = vec3(0);
+    state.material = Material(vec4(0), vec4(0), 0, 0, 0);
+   
+
+    while (stackIndex > 0) {
+        int nodeIndex = nodeStack[--stackIndex];
+        Node node = nodesBuffer[nodeIndex];
+
+        Material mat;
+        if (true) {
+  
+            mat =  Material(vec4(abs(ray.dir), 1), vec4(0), 0, 0, 0);
+            tries++;
+        
+            if (node.childIndex == 0) {
+                for (int i = node.triangleIndex; i < node.triangleIndex + node.triangleCount; i++) {
+                    HitInfo hitInfo = hitNormalTriangle(ray, triBuffer[i], mat);
+                    if (hitInfo.didHit && hitInfo.dst < state.dst) state = hitInfo;
+                }
+            }
+            else {
+                int childIndexA = node.childIndex + 0;
+                int childIndexB = node.childIndex + 1;
+                
+                Node childA = nodesBuffer[childIndexA];
+                Node childB = nodesBuffer[childIndexB];
+
+                float dstA = rayBoundingBoxDst(ray, childA.bounds.boundsMin, childA.bounds.boundsMax);
+                float dstB = rayBoundingBoxDst(ray, childB.bounds.boundsMin, childB.bounds.boundsMax);
+
+                bool isNearestA = dstA < dstB;
+                float dstNear = isNearestA ? dstA : dstB;
+                float dstFar = isNearestA ? dstB : dstA;
+                int childIndexNear = isNearestA ? childIndexA : childIndexB;
+                int childIndexFar = isNearestA ? childIndexB : childIndexA;
+
+                if (dstFar < state.dst) nodeStack[stackIndex++] = childIndexFar;
+                if (dstNear < state.dst) nodeStack[stackIndex++] = childIndexNear;
+            }
+        }
+    }
+    return state;
+}
+
+
+HitInfo hitTriangle(Ray ray, ShaderTriangle tri) {
+    vec3 edgeAB = tri.posB - tri.posA;
+    vec3 edgeAC = tri.posC - tri.posA;
+    vec3 normalVector = cross(edgeAB, edgeAC);
+    vec3 ao = ray.origin - tri.posA;
+    vec3 dao = cross(ao, ray.dir);
+
+    float determinant = -dot(ray.dir, normalVector);
+    float invDet = 1 / determinant;
+
+    float dst = dot(ao, normalVector) * invDet;
+    float u = dot(edgeAC, dao) * invDet;
+    float v = -dot(edgeAB, dao) * invDet;
+    float w = 1 - u - v;
+
+    HitInfo hitInfo;
+    hitInfo.didHit = determinant >= 1e-6 && dst >=0 && u >= 0 && v >= 0 && w >=0;
+    if (hitInfo.didHit) {
+        hitInfo.hitPoint = ray.origin + ray.dir * dst;
+        hitInfo.normal = normalize(tri.normalA * w + tri.normalB * u + tri.normalC * v);
+        hitInfo.dst = dst;
+        hitInfo.material = tri.material;
+    }
+    return hitInfo;
+}
+
+HitInfo calculateRayHit(Ray ray, inout uint numTriTests) {
+    float d = 1.0 / 0;
+    HitInfo closestHit;
+    closestHit.didHit = false;
+    closestHit.dst = d;
+    closestHit.hitPoint = vec3(0);
+    closestHit.normal = vec3(0);
+    closestHit.material = Material(vec4(0), vec4(0), 0, 0, 0);
+
+    for (uint i = 0; i < numSpheres; i++) {
+        HitInfo hitInfo = hit(ray, spheres[i]);
+        if (hitInfo.didHit && hitInfo.dst < closestHit.dst) {
+            closestHit = hitInfo;
+        }
+    }
+    
+//    int totalTri = 0;
+//    for (int i = 0; i < 3; i++) {
+//        MeshInfo mesh = meshesBuffer[i];
+//        if (rayBoundingBox(ray, mesh.boundsMin.xyz, mesh.boundsMax.xyz)) {
+//            for (int j = int(mesh.info.x); j < mesh.info.y + totalTri; j++) {
+//                HitInfo hitInfo = hitNormalTriangle(ray, triBuffer[j], mesh.material);
+//                numTriTests++;
+//
+//                if (hitInfo.didHit && hitInfo.dst < closestHit.dst) {
+//                    closestHit = hitInfo;
+//                }
+//            }
+//        }
+//        totalTri += int(mesh.info.y);
+//    }
+
+    HitInfo hitInfo = rayTriangleBVHTest(ray, numTriTests);
+    if (hitInfo.dst < closestHit.dst) {
+        closestHit = hitInfo;
+    }
+
+    return closestHit;
+}
+
+HitInfo hit(Ray ray, Sphere sphere) {
+    HitInfo hitInfo;
+    hitInfo.didHit = false;
+
+    float a = dot(ray.dir, ray.dir);
+    float b = 2.0 * dot(ray.dir, ray.origin - sphere.center);
+    float c = dot(ray.origin - sphere.center, ray.origin - sphere.center) - sphere.radius * sphere.radius;
+    float discriminat = b * b - 4 * a * c;
+
+    if (discriminat >= 0 ) {
+        float dst = (-b - sqrt(discriminat)) / (2 * a);
+        if (dst >= 0) {
+            hitInfo.didHit = true;
+            hitInfo.dst = dst;
+            hitInfo.hitPoint = ray.origin + ray.dir * dst;
+            hitInfo.normal = normalize(hitInfo.hitPoint - sphere.center);
+            hitInfo.material = sphere.material;
+        }
+    }
+    return hitInfo;
+}
+
+float randomValue(inout uint state) { 
+    state *= state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result / 4294967295.0;
+}
+
+float randomValueNormalDistribution(inout uint state) {
+	float theta = 2 * 3.1415926 * randomValue(state);
+	float rho = sqrt(-2 * log(randomValue(state)));
+    return rho * cos(theta);
+}
+
+vec3 randomDirection(inout uint state) {
+    float x = randomValueNormalDistribution(state);
+    float y = randomValueNormalDistribution(state);
+	float z = randomValueNormalDistribution(state);
+	return normalize(vec3(x, y, z));
+}
+
+vec3 randomHemisphereDirection(vec3 normal, inout uint state) {
+    vec3 dir = randomDirection(state);
+    return dir * sign(dot(normal, dir));
+}
+
+vec2 randomPointOnCircle(inout uint rngState) {
+    float angle = randomValue(rngState) * 2 * 3.1415;
+    vec2 pointOnCircle = vec2(cos(angle), sin(angle));
+    return pointOnCircle * sqrt(randomValue(rngState));
+}
+
+vec3 getEnviromentColor(Ray pRay) {
+    float skyGradientT = pow(smoothstep(0.0, 0.4, -pRay.dir.z), 0.35);
+    vec3 skyGradient = mix(skyColorHorizon, skyColorZenith, skyGradientT);
+    float sun = pow(max(0, dot(pRay.dir, -sunLightDirection)), sunFocus) * sunIntensity;
+
+    float groundToSkyT = smoothstep(-0.01, 0.0, -pRay.dir.z);
+    float sunMask = groundToSkyT >= 1 ? 1 : 0;
+    return mix(groundColor, skyGradient, groundToSkyT) + sun * sunMask;
+}
